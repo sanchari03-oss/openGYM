@@ -35,9 +35,11 @@ import { effectiveRoutineId } from './queue.js';
 import { stampPut } from './sync-stamps.js';
 import { atomicWrite as durableWrite } from './durable.js';
 import { excusedOn, nudgeFor, nudgeWindowOpen, toneOf } from './nudge.js';
+import * as neonDb from './db-neon.js';
 
+const USE_NEON = Boolean(process.env.DATABASE_URL);
 const PORT = +(process.env.PORT || 3000);
-const DATA = process.env.DATA_DIR || '/data';
+const DATA = process.env.DATA_DIR || (process.env.VERCEL ? '/tmp/opengym-data' : (fs.existsSync('/data') ? '/data' : path.join(process.cwd(), 'data')));
 const RP_ID = process.env.RP_ID || 'localhost';
 const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
 const RP_NAME = process.env.RP_NAME || 'openGym';
@@ -94,7 +96,7 @@ const MAX_BODY = 5 * 1024 * 1024;
 // Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
 
-fs.mkdirSync(DATA, { recursive: true });
+try { fs.mkdirSync(DATA, { recursive: true }); } catch { /* ignore if already exists or read-only */ }
 /* The secrets are locked down file by file rather than by sealing the whole directory.
  *
  * A blanket `chmod 0700` on DATA looks stronger and is worse: ./data is a host bind mount and
@@ -107,12 +109,17 @@ fs.mkdirSync(DATA, { recursive: true });
  * reason to refuse to boot. The privilege drop in adapters/spawn.js is the control that does
  * fail closed. */
 const lock = f => { try { fs.chmodSync(path.join(DATA, f), 0o600); } catch { /* not present yet, or host says no */ } };
-['secret', 'db.json', 'coach.json'].forEach(lock);
+if (!USE_NEON) {
+  ['secret', 'db.json', 'coach.json'].forEach(lock);
+}
 
 /* ---------- secret + db ---------- */
+let SECRET = process.env.SESSION_SECRET ? process.env.SESSION_SECRET.trim() : '';
 const secretFile = path.join(DATA, 'secret');
-if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
-const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
+if (!USE_NEON) {
+  if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
+  SECRET = fs.readFileSync(secretFile, 'utf8').trim();
+}
 
 const dbFile = path.join(DATA, 'db.json');
 // Every account, passkey and invite. Only a missing file starts empty: an unreadable one (a write
@@ -122,6 +129,7 @@ const dbFile = path.join(DATA, 'db.json');
 // saveDb keeps of each version it writes (db.json.bak) is used; with neither readable the server
 // refuses to start, saying why, rather than start as a new instance.
 function loadDb() {
+  if (USE_NEON) return { users: [], creds: [], subs: [], invites: [], deviceLinks: [] };
   let raw;
   try { raw = fs.readFileSync(dbFile, 'utf8'); }
   catch (e) { if (e.code === 'ENOENT') return { users: [], creds: [], subs: [], invites: [] }; throw e; }
@@ -154,6 +162,10 @@ const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(us
 // whatever the last save wrote (a profile just created) when db.json was later found unreadable.
 // A write cut short leaves the previous db.json.bak whole (temporary file and rename).
 function saveDb() {
+  if (USE_NEON) {
+    neonDb.saveDb(db).catch(e => console.error('neon saveDb failed', e.message));
+    return;
+  }
   const text = JSON.stringify(db, null, 2);
   atomicWrite(dbFile, text, 0o600);
   try { atomicWrite(dbFile + '.bak', text, 0o600); }
@@ -179,13 +191,20 @@ function notePull(user, now = Date.now()) {
 // The later of the last push and the last pull.
 const lastSyncOf = (u, S) => Math.max(S?._ts || 0, u?.lastPull || 0) || null;
 function readState(uid) {
+  if (USE_NEON) {
+    const hit = stateCache.get(uid);
+    return hit?.S || null;
+  }
   try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
 }
 // GET and PUT /api/data tell a profile with no state yet from one whose file cannot be read: the
 // second answers 503 instead of an empty profile, which a device would adopt, or a write would
 // replace, losing what a restore could still bring back.
 const UNREADABLE = Symbol('unreadable');
-function readStateStrict(uid) {
+async function readStateStrict(uid) {
+  if (USE_NEON) {
+    return await neonDb.readStateStrict(uid);
+  }
   let raw;
   try { raw = fs.readFileSync(stateFile(uid), 'utf8'); }
   catch (e) { return e.code === 'ENOENT' ? null : UNREADABLE; }
@@ -210,11 +229,13 @@ const records = v => (Array.isArray(v) ? v.filter(record) : []);
 
 /* ---------- push notifications (Web Push / VAPID) ---------- */
 const vapidFile = path.join(DATA, 'vapid.json');
-let vapid;
-try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
-catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
+let vapid = null;
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
-webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
+if (!USE_NEON) {
+  try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
+  catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
+  webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
+}
 
 /* A push subscription's `endpoint` is a URL this server connects out to, chosen by whoever is
    signed in — so without a check /api/push/* is a request-forgery lever, and the api container
@@ -464,6 +485,13 @@ const STATE_CACHE_MAX = 64;
 const STATE_CACHE_TTL_MS = Math.max(50, +(process.env.STATE_CACHE_TTL_MS || 600000) || 600000);
 const stateCache = new Map(); // uid -> { mtimeMs, size, hitAt, S }
 function readStateCached(uid) {
+  if (USE_NEON) {
+    const hit = stateCache.get(uid);
+    if (hit && Date.now() - hit.hitAt < STATE_CACHE_TTL_MS) {
+      return hit.S;
+    }
+    return hit?.S || null;
+  }
   let st;
   try { st = fs.statSync(stateFile(uid)); } catch { stateCache.delete(uid); return null; }
   const now = Date.now();
@@ -689,19 +717,23 @@ const challenges = new Map(); // cid -> {kind, challenge, name?, uid?, exp}
 // for five minutes, so the Map has a ceiling: past it the oldest goes. A ceremony takes seconds,
 // so only a flood far beyond any real sign-in traffic reaches back far enough to cost one.
 const MAX_CHALLENGES = 20000;
-function putChallenge(data) {
+async function putChallenge(data) {
+  if (USE_NEON) return await neonDb.putChallenge(data);
   while (challenges.size >= MAX_CHALLENGES) challenges.delete(challenges.keys().next().value);
   const cid = crypto.randomBytes(16).toString('base64url');
   challenges.set(cid, { ...data, exp: Date.now() + 5 * 60000 });
   return cid;
 }
-function takeChallenge(cid) {
+async function takeChallenge(cid) {
+  if (USE_NEON) return await neonDb.takeChallenge(cid);
   const c = challenges.get(cid);
   challenges.delete(cid);
   if (!c || c.exp < Date.now()) return null;
   return c;
 }
-setInterval(() => { for (const [k, v] of challenges) if (v.exp < Date.now()) challenges.delete(k); }, 60000).unref();
+if (!process.env.VERCEL) {
+  setInterval(() => { for (const [k, v] of challenges) if (v.exp < Date.now()) challenges.delete(k); }, 60000).unref();
+}
 
 // ---------- device pairing (mobile app "connect to my server", no WebAuthn ceremony) ----------
 // A passkey ceremony can't run inside the app's WebView (its origin never matches RP_ID), so the
@@ -716,7 +748,23 @@ function makePairCode() {
   } while (pairings.has(code));
   return code;
 }
-setInterval(() => { for (const [k, v] of pairings) if (v.exp < Date.now()) pairings.delete(k); }, 60000).unref();
+async function putPairing(code, uid) {
+  if (USE_NEON) return await neonDb.putPairing(code, uid);
+  pairings.set(code, { uid, exp: Date.now() + 5 * 60000 });
+}
+async function takePairing(code) {
+  if (USE_NEON) return await neonDb.takePairing(code);
+  const p = pairings.get(code);
+  if (p) pairings.delete(code);
+  return p;
+}
+async function dropPairingsForUser(uid) {
+  if (USE_NEON) return await neonDb.dropPairingsForUser(uid);
+  for (const [k, v] of pairings) if (v.uid === uid) pairings.delete(k);
+}
+if (!process.env.VERCEL) {
+  setInterval(() => { for (const [k, v] of pairings) if (v.exp < Date.now()) pairings.delete(k); }, 60000).unref();
+}
 
 /* ---------- helpers ---------- */
 function json(res, code, obj, extraHeaders) {
@@ -732,6 +780,31 @@ class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 function readBody(req) {
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      if (Array.isArray(req.body)) return Promise.reject(new HttpError(400, 'invalid json'));
+      return Promise.resolve(req.body);
+    }
+    if (Buffer.isBuffer(req.body)) {
+      try {
+        const parsed = JSON.parse(req.body.toString('utf8'));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return Promise.reject(new HttpError(400, 'invalid json'));
+        return Promise.resolve(parsed);
+      } catch {
+        return Promise.reject(new HttpError(400, 'invalid json'));
+      }
+    }
+    if (typeof req.body === 'string') {
+      try {
+        const parsed = JSON.parse(req.body);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return Promise.reject(new HttpError(400, 'invalid json'));
+        return Promise.resolve(parsed);
+      } catch {
+        return Promise.reject(new HttpError(400, 'invalid json'));
+      }
+    }
+  }
+
   return new Promise((resolve, reject) => {
     let size = 0, over = false; const chunks = [];
     req.on('data', d => {
@@ -1121,7 +1194,7 @@ function setPassword(user, h) {
 // outlives "sign out everywhere". Same ceremony as /api/login/verify, and the credential has
 // to belong to this account.
 async function passkeyStepUp(user, body) {
-  const c = takeChallenge(body.cid);
+  const c = await takeChallenge(body.cid);
   const cred = c?.kind === 'login' && db.creds.find(x => x.id === body.credential?.id && x.userId === user.id);
   if (!cred) return false;
   try {
@@ -1602,7 +1675,7 @@ const passkeyRoutes = {
     if (readSession(req) !== user) return notSignedIn(res);
     if (proof === 'passkey') saveDb();   // the confirming passkey's counter and last use
     const options = await moreOptions(user);
-    const cid = putChallenge({ challenge: options.challenge, uid: user.id, kind: 'add', sv: sessionVersion(user), proof });
+    const cid = await putChallenge({ challenge: options.challenge, uid: user.id, kind: 'add', sv: sessionVersion(user), proof });
     json(res, 200, { cid, options });
   },
 
@@ -1610,7 +1683,7 @@ const passkeyRoutes = {
     const user = readSession(req);
     if (!user) return notSignedIn(res);
     const body = await readBody(req);
-    const c = takeChallenge(text(body.cid));
+    const c = await takeChallenge(text(body.cid));
     if (!c || c.kind !== 'add' || c.uid !== user.id) {
       audit(req, 'auth.passkey.fail', { ok: false, user, msg: 'challenge-expired' });
       return json(res, 400, { error: 'challenge expired, try again', code: 'challenge-expired' });
@@ -1706,7 +1779,7 @@ const passkeyRoutes = {
     }
     if (passkeyCount(user) >= MAX_PASSKEYS) return json(res, 409, LIMIT);
     const options = await moreOptions(user);
-    const cid = putChallenge({ challenge: options.challenge, uid: user.id, kind: 'link', lh: link.h });
+    const cid = await putChallenge({ challenge: options.challenge, uid: user.id, kind: 'link', lh: link.h });
     json(res, 200, { cid, options, id: user.id, name: user.name });
   },
 
@@ -1717,7 +1790,7 @@ const passkeyRoutes = {
     const body = await readBody(req);
     if (addressPaused(req, res, 'link')) return;
     const code = text(body.code);
-    const c = takeChallenge(text(body.cid));
+    const c = await takeChallenge(text(body.cid));
     const link = findDeviceLink(db, code);
     if (!link) {
       strikeAddress(req, 'link');
@@ -1978,13 +2051,13 @@ const routes = {
       authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
       excludeCredentials: []
     });
-    const cid = putChallenge({ kind: 'register', challenge: options.challenge, name, uid, code });
+    const cid = await putChallenge({ kind: 'register', challenge: options.challenge, name, uid, code });
     json(res, 200, { cid, options });
   },
 
   'POST /api/register/verify': async (req, res) => {
     const body = await readBody(req);
-    const c = takeChallenge(body.cid);
+    const c = await takeChallenge(body.cid);
     if (!c || c.kind !== 'register' || !c.uid) {
       auditFail(req, 'auth.register.fail', { ok: false, msg: 'challenge-expired' });
       return json(res, 400, { error: 'challenge expired, try again', code: 'challenge-expired' });
@@ -2042,13 +2115,13 @@ const routes = {
     const options = await generateAuthenticationOptions({
       rpID: RP_ID, userVerification: 'preferred', allowCredentials: []
     });
-    const cid = putChallenge({ kind: 'login', challenge: options.challenge });
+    const cid = await putChallenge({ kind: 'login', challenge: options.challenge });
     json(res, 200, { cid, options });
   },
 
   'POST /api/login/verify': async (req, res) => {
     const body = await readBody(req);
-    const c = takeChallenge(body.cid);
+    const c = await takeChallenge(body.cid);
     if (c?.kind !== 'login') {
       auditFail(req, 'auth.login.fail', { ok: false, msg: 'challenge-expired' });
       return json(res, 400, { error: 'challenge expired, try again', code: 'challenge-expired' });
@@ -2118,7 +2191,7 @@ const routes = {
     user.sv = sessionVersion(user) + 1;
     // An unredeemed pairing code is a session-in-waiting for this account; it goes too, and so
     // does an unused device link.
-    for (const [k, v] of pairings) if (v.uid === user.id) pairings.delete(k);
+    await dropPairingsForUser(user.id);
     dropDeviceLinks(db, user.id);
     saveDb();
     audit(req, 'auth.logout.all', { user });
@@ -2132,9 +2205,9 @@ const routes = {
     if (!user) return json(res, 401, { error: 'not signed in' });
     // One live code per profile: the newest is the one on screen. Keeping every code minted
     // let one session grow this Map without limit for five minutes at a time.
-    for (const [k, v] of pairings) if (v.uid === user.id) pairings.delete(k);
+    await dropPairingsForUser(user.id);
     const code = makePairCode();
-    pairings.set(code, { uid: user.id, exp: Date.now() + 5 * 60000 });
+    await putPairing(code, user.id);
     audit(req, 'auth.pair.create', { user });
     json(res, 200, { code });
   },
@@ -2144,9 +2217,8 @@ const routes = {
   'POST /api/pair/redeem': async (req, res) => {
     const body = await readBody(req);
     const code = text(body.code).trim().toUpperCase();
-    const p = pairings.get(code);
-    if (p) pairings.delete(code);
-    if (!p || p.exp < Date.now()) {
+    const p = await takePairing(code);
+    if (!p) {
       auditFail(req, 'auth.pair.fail', { ok: false, msg: 'code-invalid' });
       return json(res, 400, { error: 'invalid or expired code', code: 'pair-invalid' });
     }
@@ -2174,7 +2246,7 @@ const routes = {
   'GET /api/data': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    const state = readStateStrict(user.id);
+    const state = await readStateStrict(user.id);
     if (state === UNREADABLE) { console.error('state file unreadable for', user.id); return json(res, 503, { error: 'state unreadable' }); }
     notePull(user);
     json(res, 200, { state: forClient(state), rev: state?._rev || 0 });
@@ -2188,6 +2260,10 @@ const routes = {
   'GET /api/data/rev': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
+    if (USE_NEON) {
+      const revData = await neonDb.readStateRev(user.id);
+      return json(res, 200, { rev: revData?._rev || 0, ...(revData?._wid ? { wid: revData._wid } : {}) });
+    }
     const doc = readStateCached(user.id);
     json(res, 200, { rev: doc?._rev || 0, ...(doc?._wid ? { wid: doc._wid } : {}) });
   },
@@ -2227,7 +2303,7 @@ const routes = {
     // before revisions, or a deliberate replace such as a backup import) overwrites, as before.
     // readState and atomicWrite are synchronous with nothing awaited between them, so the
     // compare-and-write is atomic for this process.
-    const cur = readStateStrict(user.id);
+    const cur = await readStateStrict(user.id);
     if (cur === UNREADABLE) { console.error('state file unreadable for', user.id); return json(res, 503, { error: 'state unreadable' }); }
     const curRev = cur?._rev || 0;
     // `_rev` is a counter, so after the data directory went back in time (a restored backup, a
@@ -2273,21 +2349,23 @@ const routes = {
     let text;
     try { text = JSON.stringify(body.state); }
     catch (e) { if (e instanceof RangeError) return json(res, 400, { error: 'invalid state' }); throw e; }
-    atomicWrite(stateFile(user.id), text);
-    // The stat cache cannot see this write on its own: mtime granularity is 4 ms here (ext4 on
-    // this kernel — 3901 of 3999 back-to-back same-size writes shared one timestamp), and a
-    // `_rev` going from 7 to 8 does not change the file's size, so two writes inside one 4 ms
-    // tick are the same (mtimeMs, size) key. A reader that sampled between them would then serve
-    // the old revision until some later write happened to land on a different tick. This is the
-    // only writer of a state file in the tree, so evicting here is the whole fix.
-    stateCache.delete(user.id);
+    if (USE_NEON) {
+      const resState = await neonDb.saveStateAtomic(user.id, body.state, body.state._rev, body.state._wid, body.baseRev != null ? curRev : -1);
+      if (resState.conflict) {
+        return json(res, 409, { error: 'conflict', rev: resState.rev, state: forClient(resState.state) });
+      }
+      stateCache.set(user.id, { mtimeMs: Date.now(), size: text.length, hitAt: Date.now(), S: body.state });
+    } else {
+      atomicWrite(stateFile(user.id), text);
+      stateCache.delete(user.id);
+    }
     // Starts (or stops) the grace clock of every stored file this write stopped (or started)
     // referencing. Bookkeeping only: the state is already saved, so nothing here may turn a
     // successful write into an error.
     if (MEDIA_ON) {
       try { MEDIA.noteState(user.id, body.state); } catch (e) { console.error('media noteState', e); }
     }
-    json(res, 200, { ok: true, ts: body.state._ts || null, rev: curRev + 1, wid: body.state._wid });
+    json(res, 200, { ok: true, ts: body.state._ts || null, rev: body.state._rev, wid: body.state._wid });
   },
 
   'GET /api/push/public-key': async (req, res) => json(res, 200, { key: vapid.publicKey }),
@@ -2623,7 +2701,15 @@ function bodyDeadline(req) {
 // The Capacitor WebView origins of the Android and iOS app.
 const APP_ORIGINS = new Set(['https://localhost', 'capacitor://localhost', 'http://localhost']);
 
-const server = http.createServer(async (req, res) => {
+export async function handleRequest(req, res) {
+  if (USE_NEON) {
+    try {
+      const freshDb = await neonDb.loadDb();
+      if (freshDb) db = freshDb;
+    } catch (e) {
+      console.error('neon loadDb failed in handleRequest', e.message);
+    }
+  }
   bodyDeadline(req);
   // Same-origin (the deployed nginx-proxied web app) never triggers CORS, so this only matters
   // for the paired mobile app calling in from its own WebView origin. It carries no cookie
@@ -2695,15 +2781,34 @@ const server = http.createServer(async (req, res) => {
     console.error(key, e);
     if (!res.headersSent) json(res, 500, { error: 'server error' });
   }
-});
-// Node's default of 300 s for a whole request would answer 408 to a 40 MB video on a ~1 Mbit/s
-// uplink. Half an hour covers that; a stalled upload is cut much sooner by its own 60 s idle
-// timer in media.js, a client that never finishes its headers still meets headersTimeout, and
-// every other route's body still has to arrive within five minutes (bodyDeadline above).
+}
+
+const server = http.createServer(handleRequest);
 server.requestTimeout = 30 * 60000;
 server.headersTimeout = 60000;
-// The port is read back off the listener rather than echoed from PORT, so the line states the
-// port that was actually bound: with PORT=0 the OS picks one, and a caller that did not choose it
-// (the tests spawn the server that way, and so does anyone running two instances on one box) has
-// no other way to learn it.
-server.listen(PORT, () => console.log(`gym-api on :${server.address().port} (rpID=${RP_ID}, origin=${ORIGIN})`));
+
+export async function initServer() {
+  if (USE_NEON) {
+    await neonDb.ensureSchema();
+    if (!SECRET) {
+      SECRET = await neonDb.getOrInitSecret();
+    }
+    if (!vapid) {
+      vapid = await neonDb.getOrInitVapid(ORIGIN, SECURE);
+      if (vapid) {
+        webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
+      }
+    }
+    const freshDb = await neonDb.loadDb();
+    if (freshDb) db = freshDb;
+  }
+}
+
+export { server };
+
+const isMainModule = process.argv[1] && (process.argv[1].endsWith('server.js') || process.argv[1].endsWith('server.mjs'));
+
+if (!process.env.VERCEL && !process.env.AWS_LAMBDA_FUNCTION_NAME && isMainModule) {
+  initServer().catch(err => console.error('initServer failed:', err));
+  server.listen(PORT, () => console.log(`gym-api on :${server.address().port} (rpID=${RP_ID}, origin=${ORIGIN})`));
+}

@@ -1,0 +1,15 @@
+catalogue/
+data/
+android/
+ios/
+docs/
+scripts/
+contrib/
+helm/
+kubernetes/
+.git/
+.github/
+.gitlab/
+.gitea/
+website/
+mcp/
