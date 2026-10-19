@@ -1,5 +1,21 @@
 {
+  "name": "opengym",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm --prefix frontend run build",
+    "start": "node api/server.js",
+    "test": "node --test api/test/*.test.js"
+  },
   "devDependencies": {
     "js-yaml": "^4.1.0"
+  },
+  "dependencies": {
+    "@neon/config": "^1.9.2",
+    "@neon/env": "^1.6.3",
+    "@neondatabase/serverless": "^1.2.0",
+    "@simplewebauthn/server": "^14.0.3",
+    "undici": "^8.12.2",
+    "web-push": "^3.6.7"
   }
 }

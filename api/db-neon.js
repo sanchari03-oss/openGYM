@@ -1,14 +1,30 @@
 import { neon } from '@neondatabase/serverless';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import webpush from 'web-push';
 
+if (!process.env.DATABASE_URL) {
+  for (const f of ['.env.local', '.env', path.resolve(process.cwd(), '.env.local'), path.resolve(process.cwd(), '.env'), path.resolve(import.meta.dirname, '..', '.env.local'), path.resolve(import.meta.dirname, '..', '.env')]) {
+    try {
+      if (fs.existsSync(f)) {
+        process.loadEnvFile(f);
+        if (process.env.DATABASE_URL) break;
+      }
+    } catch {}
+  }
+}
+
 const databaseUrl = process.env.DATABASE_URL;
-export const sql = databaseUrl ? neon(databaseUrl) : null;
+export let sql = databaseUrl ? neon(databaseUrl) : null;
 
 let schemaInitialized = false;
 let initPromise = null;
 
 export async function ensureSchema() {
+  if (!sql && process.env.DATABASE_URL) {
+    sql = neon(process.env.DATABASE_URL);
+  }
   if (!sql) return;
   if (schemaInitialized) return;
   if (!initPromise) {
